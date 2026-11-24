@@ -6,6 +6,8 @@
   T3 交错清退：同一旧链两笔任务，先发布生效、后发布 409 并可重试
   T4 中断重启：准备后“重启”，任务作废、仍服务最后发布的链，重发可成功
   T5 HTTP 冒烟：页面、下载 Content-Length、镜像哈希与真值一致、边界 409
+  T6 选择性回退：两点比对、清零/照留语义、末块冲突、长度不符、比对途中清退
+  T7 回退任务重启恢复：comparing 半成品与孤儿文件清理、ready 任务存活
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import hashlib
 import os
 import tempfile
 
-from app import chain
+from app import chain, revert
 from app.db import connect, init_db
 from app.seed import expected_image
 from app.server import create_app
@@ -233,6 +235,163 @@ def main() -> int:
               all(j["state"] != "ready" for j in c2.get("/api/jobs").get_json()))
         check("工厂重启后链版本保持为 1",
               c2.get("/api/chain").get_json()["chain_version"] == 1)
+
+    # -------------------------------------------------------- T6 选择性回退
+    print("\nT6 选择性回退（两点比对 + 上传当前镜像 + 整盘核对）")
+    rv_db = os.path.join(tmp, "revert.db")
+    c = create_app(rv_db).test_client()
+    snap = c.get("/api/chain").get_json()
+    by_seq = {b["seq"]: b["id"] for b in snap["backups"]}
+    bs = snap["block_size"]
+    rdir = revert.revert_dir(rv_db)
+
+    def rv_prepare(pre, post):
+        return c.post("/api/revert/prepare",
+                      json={"pre_id": by_seq[pre], "post_id": by_seq[post]})
+
+    def rv_upload(rid, data):
+        return c.post(f"/api/revert/{rid}/image", data=data,
+                      content_type="application/octet-stream")
+
+    # T6a 基本回退 + 清零语义：pre=P3, post=P4，当前盘 == P4 镜像
+    r = rv_prepare(3, 4)
+    check("回退准备返回 201", r.status_code == 201)
+    prep = r.get_json()
+    check("P3→P4 有 3 个变化块（槽1/6/7）", prep["changed_blocks"] == 3, str(prep))
+    check("快照基于同一已提交链 v0", prep["based_on_version"] == 0)
+    rid_a = prep["revert_id"]
+    check("未上传时下载被拒绝（409）",
+          c.get(f"/api/revert/{rid_a}/download").status_code == 409)
+    r = rv_upload(rid_a, expected_image(4))
+    check("比对通过返回 200", r.status_code == 200, r.data.decode())
+    out = r.get_json()
+    check("回退 3 块、照留 0 块", out["reverted"] == 3 and out["already_pre"] == 0, str(out))
+    r = c.get(f"/api/revert/{rid_a}/download")
+    check("回退镜像可下载且 Content-Length=512",
+          r.status_code == 200 and r.headers["Content-Length"] == "512")
+    check("回退结果 == P3 镜像（槽6 由零恢复为 A、槽7 回退为 A）",
+          r.data == expected_image(3))
+    check("回退后槽1 为全零（显式清零按实际字节回写）", r.data[bs:2*bs] == b"\x00"*bs)
+    check("暂存目录恰有一份整盘文件",
+          os.listdir(rdir) == [f"revert-{rid_a}.img"], str(os.listdir(rdir)))
+    check("重复上传被拒绝（409）", rv_upload(rid_a, expected_image(4)).status_code == 409)
+
+    # T6b 照留语义：当前值已等于故障前值 → 照留；两点间未变化的块 → 照留
+    custom = b"X" * bs
+    cur = bytearray(expected_image(4))
+    cur[bs:2*bs] = b"\x00" * bs   # 槽1 当前值已等于故障前值（P3 时为零）→ 照留
+    cur[2*bs:3*bs] = custom       # 槽2 两点间未变化 → 照留（保留当前值）
+    rid_b = rv_prepare(3, 4).get_json()["revert_id"]
+    r = rv_upload(rid_b, bytes(cur))
+    out = r.get_json()
+    check("照留场景：回退 2 块（6、7）、照留 1 块（1）",
+          r.status_code == 200 and out["reverted"] == 2 and out["already_pre"] == 1,
+          str(out))
+    want = bytearray(expected_image(3))
+    want[2*bs:3*bs] = custom
+    r = c.get(f"/api/revert/{rid_b}/download")
+    check("照留场景镜像：槽2 保留当前值，槽6/7 已回退", r.data == bytes(want))
+
+    # T6c 末块冲突：当前值与两点都不同 → 整盘拒绝
+    cur = bytearray(expected_image(4))
+    cur[7*bs:8*bs] = b"R" * bs    # 末块（槽7）与 P3(A)、P4(E) 都不同
+    rid_c = rv_prepare(3, 4).get_json()["revert_id"]
+    r = rv_upload(rid_c, bytes(cur))
+    check("末块冲突返回 409", r.status_code == 409, r.data.decode())
+    body = r.get_json()
+    check("冲突块号列出 [7]", body.get("conflicts") == [7], str(body))
+    job = c.get(f"/api/revert/{rid_c}").get_json()
+    check("任务终态 failed 且记录冲突块", job["state"] == "failed" and job["conflicts"] == [7])
+    check("冲突任务下载被拒绝（409）",
+          c.get(f"/api/revert/{rid_c}/download").status_code == 409)
+    leftovers = [f for f in os.listdir(rdir) if rid_c in f]
+    check("冲突后暂存文件已删除", leftovers == [], str(leftovers))
+
+    # T6d 长度不符：短/长都拒绝
+    rid_d = rv_prepare(3, 4).get_json()["revert_id"]
+    r = rv_upload(rid_d, b"\x00" * 100)
+    check("短镜像返回 400 且说明长度", r.status_code == 400 and "长度" in r.get_json()["message"])
+    rid_d2 = rv_prepare(3, 4).get_json()["revert_id"]
+    r = rv_upload(rid_d2, expected_image(4) + b"x" * 10)
+    check("长镜像返回 400", r.status_code == 400)
+    check("长度不符的任务为 failed 且无暂存文件残留",
+          c.get(f"/api/revert/{rid_d}").get_json()["state"] == "failed"
+          and not [f for f in os.listdir(rdir) if rid_d in f or rid_d2 in f])
+
+    # T6e 比对途中清退：选中的故障前点 P1 随后被清退，比对仍可完成
+    prep_e = rv_prepare(1, 3).get_json()
+    rid_e = prep_e["revert_id"]
+    check("P1→P3 有 4 个变化块（槽0/1/3/5）", prep_e["changed_blocks"] == 4)
+    r = c.post(f"/api/backups/{by_seq[1]}/prepare")
+    job_e = r.get_json()["job_id"]
+    r = c.post(f"/api/jobs/{job_e}/publish")
+    check("清退照常发布（选中点 P1 被清退，链版本 → 1）",
+          r.status_code == 200 and r.get_json()["new_version"] == 1)
+    check("P1 已从链上消失",
+          [b["seq"] for b in c.get("/api/chain").get_json()["backups"]] == [0, 2, 3, 4])
+    r = rv_upload(rid_e, expected_image(3))
+    check("清退后比对仍可完成并通过", r.status_code == 200, r.data.decode())
+    check("回退 4 块", r.get_json()["reverted"] == 4)
+    r = c.get(f"/api/revert/{rid_e}/download")
+    check("回退结果 == P1 镜像（被清退点的内容仍正确）", r.data == expected_image(1))
+
+    # T6f 参数校验与任务列表/丢弃
+    check("同一恢复点被拒绝（400）",
+          c.post("/api/revert/prepare",
+                 json={"pre_id": by_seq[2], "post_id": by_seq[2]}).status_code == 400)
+    check("故障前晚于故障后被拒绝（400）", rv_prepare(4, 2).status_code == 400)
+    check("不存在的恢复点返回 404",
+          c.post("/api/revert/prepare",
+                 json={"pre_id": "nope", "post_id": by_seq[2]}).status_code == 404)
+    check("缺参数返回 400",
+          c.post("/api/revert/prepare", json={"pre_id": by_seq[2]}).status_code == 400)
+    listed = c.get("/api/revert").get_json()
+    check("任务列表包含全部任务", len(listed) == 6, str(len(listed)))
+    r = c.post(f"/api/revert/{rid_a}/discard")
+    check("丢弃任务后暂存文件被删除",
+          r.status_code == 200
+          and not os.path.exists(os.path.join(rdir, f"revert-{rid_a}.img")))
+    check("丢弃不存在的任务返回 404", c.post("/api/revert/nope/discard").status_code == 404)
+
+    # -------------------------------------------------------- T7 回退任务重启恢复
+    print("\nT7 回退任务的重启恢复（comparing 半成品 / 孤儿文件 / ready 存活）")
+    rs_db = os.path.join(tmp, "revert-restart.db")
+    cx = create_app(rs_db).test_client()
+    by_seq2 = {b["seq"]: b["id"] for b in cx.get("/api/chain").get_json()["backups"]}
+    rdir2 = revert.revert_dir(rs_db)
+    rid_ok = cx.post("/api/revert/prepare",
+                     json={"pre_id": by_seq2[3], "post_id": by_seq2[4]}).get_json()["revert_id"]
+    cx.post(f"/api/revert/{rid_ok}/image", data=expected_image(4),
+            content_type="application/octet-stream")
+    check("重启前任务已 ready",
+          cx.get(f"/api/revert/{rid_ok}").get_json()["state"] == "ready")
+    # 手工制造一笔 comparing 半成品（含半截文件）与一个孤儿文件
+    rid_half = cx.post("/api/revert/prepare",
+                       json={"pre_id": by_seq2[2], "post_id": by_seq2[4]}).get_json()["revert_id"]
+    half = os.path.join(rdir2, f"revert-{rid_half}.img")
+    with open(half, "wb") as f:
+        f.write(b"\x00" * 100)
+    orphan = os.path.join(rdir2, "revert-orphan.img")
+    with open(orphan, "wb") as f:
+        f.write(b"\x00" * 10)
+    conn_x = connect(rs_db)
+    conn_x.execute(
+        "UPDATE revert_jobs SET state = 'comparing', image_path = ? WHERE id = ?",
+        (half, rid_half))
+    conn_x.commit()
+    conn_x.close()
+    # 模拟重启：重新 create_app → 启动恢复
+    app_rs2 = create_app(rs_db)
+    check("启动恢复清理了半成品与孤儿文件（2 项）",
+          app_rs2.config["REVERT_CLEANED_ON_START"] == 2,
+          str(app_rs2.config["REVERT_CLEANED_ON_START"]))
+    cx2 = app_rs2.test_client()
+    check("comparing 半成品被标记 failed",
+          cx2.get(f"/api/revert/{rid_half}").get_json()["state"] == "failed")
+    check("半成品与孤儿文件已删除", not os.path.exists(half) and not os.path.exists(orphan))
+    r = cx2.get(f"/api/revert/{rid_ok}/download")
+    check("ready 任务在重启后仍可下载且内容正确",
+          r.status_code == 200 and r.data == expected_image(3))
 
     conn.close()
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")

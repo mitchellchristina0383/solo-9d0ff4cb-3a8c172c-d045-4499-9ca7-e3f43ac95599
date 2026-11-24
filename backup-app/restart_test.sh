@@ -3,7 +3,9 @@
 set -u
 export PYTHONPATH=/workspace/tools/pylibs
 export BACKUP_DB=/tmp/livedata/live.db
+mkdir -p /tmp/livedata
 rm -f /tmp/livedata/live.db*
+rm -rf /tmp/livedata/revert
 
 start() {
   nohup python3 -m app.server > "$1" 2>&1 &

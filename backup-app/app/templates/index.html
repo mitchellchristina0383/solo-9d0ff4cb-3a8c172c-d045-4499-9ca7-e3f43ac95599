@@ -38,12 +38,14 @@
   .state-stale { color:var(--err); font-weight:600; }
   .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  select, input[type=file] { font-size:13px; max-width:320px; }
+  label { font-size:13px; color:var(--mut); }
 </style>
 </head>
 <body>
 <header>
-  <h1>备份链管理 · 中间恢复点清退</h1>
-  <p>定长块增量链 · 缺省块向前继承 · 显式清零块还原为零 · 清退只并入指针、不生成临时整盘</p>
+  <h1>备份链管理 · 中间恢复点清退 / 选择性回退</h1>
+  <p>定长块增量链 · 缺省块向前继承 · 显式清零块还原为零 · 清退只并入指针、不生成临时整盘 · 回退就地回写同一份暂存镜像</p>
 </header>
 <div id="flash"></div>
 <main>
@@ -66,6 +68,24 @@
     </table>
     <p class="muted" style="margin-bottom:0">
       准备期间原链完全不变、仍可下载还原；发布用链版本做乐观并发：同一旧链上先发布者生效，后发布者报 409 并提示重试。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>选择性回退（撤掉误写，保留后来写到其他块的数据）</h2>
+    <div class="row" style="margin-bottom:10px">
+      <label>故障前 <select id="preSel"></select></label>
+      <label>故障后 <select id="postSel"></select></label>
+      <input type="file" id="imgFile">
+      <button class="primary" onclick="startRevert()">创建任务并上传比对</button>
+    </div>
+    <table>
+      <thead><tr><th>任务</th><th>区间</th><th>基线版本</th><th>变化块</th><th>回退/照留</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="reverts"><tr><td colspan="7" class="muted">暂无任务</td></tr></tbody>
+    </table>
+    <p class="muted" style="margin-bottom:0">
+      选故障前、后两个恢复点（取自同一份已提交链），上传同尺寸当前 RAW 镜像。只回退“两点间有变化且当前值仍等于故障后值”的块；
+      当前值已等于故障前值的块与两点间未变化的块照留；与两点都不同的块列为冲突并整盘拒绝。比对期间清退照常发布，不影响本次比对。
     </p>
   </section>
 </main>
@@ -108,6 +128,16 @@ async function refresh() {
     </tr>`;
   }).join('');
 
+  // 回退下拉框：保留当前选择；故障后默认选末端点
+  const keepPre = $('#preSel').value, keepPost = $('#postSel').value;
+  const opts = snap.backups.map(b =>
+    `<option value="${b.id}">P${b.seq} · ${b.kind === 'full' ? '全备' : '增量'} · ${b.label}</option>`).join('');
+  $('#preSel').innerHTML = opts;
+  $('#postSel').innerHTML = opts;
+  if (keepPre) $('#preSel').value = keepPre;
+  if (keepPost) $('#postSel').value = keepPost;
+  if (!$('#postSel').value && n >= 2) $('#postSel').selectedIndex = n - 1;
+
   const jobs = await api('/api/jobs');
   $('#jobs').innerHTML = jobs.length ? jobs.map(j => `<tr>
       <td class="mono">${shortId(j.id)}</td>
@@ -122,6 +152,62 @@ async function refresh() {
           : ''}
       </td>
     </tr>`).join('') : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+
+  const reverts = await api('/api/revert');
+  $('#reverts').innerHTML = reverts.length ? reverts.map(j => {
+    const stateText = {
+      awaiting_upload: '待上传镜像', comparing: '比对中',
+      ready: '比对通过', failed: '已拒绝',
+    }[j.state] || j.state;
+    const detail = j.state === 'failed'
+      ? `已拒绝${j.conflicts && j.conflicts.length ? '（冲突块 ' + j.conflicts.join(', ') + '）' : ''}${j.error ? '：' + j.error : ''}`
+      : stateText;
+    return `<tr>
+      <td class="mono">${shortId(j.id)}</td>
+      <td class="mono">P${j.pre_seq} → P${j.post_seq}</td>
+      <td>v${j.based_on_version}</td>
+      <td>${j.changed_blocks}</td>
+      <td>${j.reverted ?? '—'} / ${j.already_pre ?? '—'}</td>
+      <td class="${j.state === 'ready' ? 'state-published' : j.state === 'failed' ? 'state-stale' : 'state-ready'}">${detail}</td>
+      <td class="row">
+        ${j.state === 'ready' ? `<a class="dl" href="/api/revert/${j.id}/download">下载回退镜像</a>` : ''}
+        <button onclick="discardRevert('${j.id}')">丢弃</button>
+      </td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="muted">暂无任务</td></tr>';
+}
+
+async function startRevert() {
+  const pre = $('#preSel').value, post = $('#postSel').value;
+  const file = $('#imgFile').files[0];
+  if (!pre || !post) { toast('请选择故障前、故障后两个恢复点', 'err'); return; }
+  if (!file) { toast('请选择当前 RAW 镜像文件', 'err'); return; }
+  try {
+    const prep = await api('/api/revert/prepare', {
+      method: 'POST',
+      body: JSON.stringify({pre_id: pre, post_id: post}),
+    });
+    toast(`回退任务已创建（P${prep.pre_seq} → P${prep.post_seq}，${prep.changed_blocks} 个变化块，基于链 v${prep.based_on_version}），上传比对中…`, 'info');
+    // 请求体即镜像字节（application/octet-stream），服务端逐块流式落盘
+    const r = await fetch(`/api/revert/${prep.revert_id}/image`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/octet-stream'},
+      body: file,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast(`整盘核对通过：回退 ${data.reverted} 块，照留 ${data.already_pre} 块（两点间共 ${data.changed_blocks} 块有变化），可下载`, 'ok');
+    } else if (data.conflicts && data.conflicts.length) {
+      toast(`比对被拒绝：块 ${data.conflicts.join(', ')} 的当前值与两点都不同（冲突）`, 'err');
+    } else {
+      toast(data.message || ('HTTP ' + r.status), 'err');
+    }
+  } catch (e) { toast(e.message, 'err'); }
+  refresh();
+}
+async function discardRevert(id) {
+  try { await api(`/api/revert/${id}/discard`, {method:'POST'}); toast('已丢弃该回退任务并删除暂存镜像', 'info'); refresh(); }
+  catch (e) { toast(e.message, 'err'); }
 }
 
 async function prepare(id) {

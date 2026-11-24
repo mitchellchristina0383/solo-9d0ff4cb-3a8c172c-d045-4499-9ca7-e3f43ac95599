@@ -22,7 +22,11 @@ VERSION_KEY = "chain_version"
 
 
 class DomainError(Exception):
-    """业务错误基类。"""
+    """业务错误基类。extra 里的键值会并入 HTTP 错误响应（如冲突块号列表）。"""
+
+    def __init__(self, message: str, **extra):
+        super().__init__(message)
+        self.extra = extra
 
 
 class NotFoundError(DomainError):
@@ -122,18 +126,18 @@ def _block_content(conn: sqlite3.Connection, block_hash: str) -> bytes:
     return row["content"]
 
 
-def materialize_blocks(conn: sqlite3.Connection, backup_id: str):
-    """按块生成还原镜像的生成器（流式响应，不落临时整盘）。
+def resolve_pointers(conn: sqlite3.Connection, backup_id: str) -> dict[int, tuple[str, int]]:
+    """沿链折叠出目标恢复点每个槽位的最终指针：block_index -> (hash, is_zero)。
 
-    缺省块沿链向前继承；显式清零块产出全零字节。
+    缺省槽位沿链向前继承；显式清零槽位以 is_zero=1 表示。还原镜像与
+    选择性回退共用同一份折叠逻辑，保证“继承 + 清零后的实际字节”口径一致。
     """
     target = get_backup(conn, backup_id)
-    block_size, block_count = disk_spec(conn)
+    _block_size, block_count = disk_spec(conn)
     ordered = [b for b in list_backups(conn) if b["seq"] <= target["seq"]]
     if not ordered:  # pragma: no cover - 目标本身存在时不可能为空
         raise NotFoundError("链为空")
 
-    # 沿链折叠出目标恢复点每个槽位的最终指针
     state: dict[int, tuple[str, int]] = {}
     for b in ordered:
         for r in list_pointers(conn, b["id"]):
@@ -146,6 +150,17 @@ def materialize_blocks(conn: sqlite3.Connection, backup_id: str):
     missing = [i for i in range(block_count) if i not in state and i not in full_indices]
     if missing:
         raise DomainError(f"槽位 {missing[:5]} 无法沿链解析，数据不完整")
+    return state
+
+
+def materialize_blocks(conn: sqlite3.Connection, backup_id: str):
+    """按块生成还原镜像的生成器（流式响应，不落临时整盘）。
+
+    缺省块沿链向前继承；显式清零块产出全零字节。
+    """
+    get_backup(conn, backup_id)  # 不存在时抛 404
+    block_size, block_count = disk_spec(conn)
+    state = resolve_pointers(conn, backup_id)
 
     for i in range(block_count):
         pointer = state.get(i)
